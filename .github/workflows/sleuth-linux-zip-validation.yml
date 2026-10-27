@@ -1,0 +1,406 @@
+# DRAFT. Runs only on the rswerve fork of trussworks/terraform-aws-iam-sleuth.
+#
+# Builds the candidate commit's deployment ZIP with its own scripts/build and
+# hash-enforcing pip, checks the ZIP against checksums.txt, checks the ZIP's
+# packages against the candidate's export and poetry.lock, and imports handler
+# and the SDKs from the extracted ZIP alone.
+#
+# Limit: this proves a Linux x86_64 CPython 3.13 ZIP and its imports. It does
+# not prove a deployed AWS Lambda runtime, or any ABI beyond Linux x86_64
+# CPython 3.13.
+name: Sleuth Linux ZIP validation
+
+on:
+  push:
+    branches:
+      - codex/sleuth-dependency-validation-20261026
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux-zip:
+    name: Build and check Linux ZIP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Replace only this value with the candidate's full commit SHA.
+      CANDIDATE_SHA: 632ed00aa97a7079bf793e0eb3121a1b6086d562
+      PYTHON_VERSION: "3.13.17"
+      PIP_FLOOR: "26.2.2"
+      ZIP_NAME: validation.zip
+    steps:
+      - name: Check candidate SHA
+        id: candidate-sha
+        run: |
+          if [[ $CANDIDATE_SHA == REPLACE_WITH_CANDIDATE_SHA ]]; then
+            echo "::error::CANDIDATE_SHA is still the placeholder"
+            exit 1
+          fi
+          if [[ ! $CANDIDATE_SHA =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::CANDIDATE_SHA is not a full lowercase 40-hex SHA: $CANDIDATE_SHA"
+            exit 1
+          fi
+          if [[ $CANDIDATE_SHA == "$GITHUB_SHA" ]]; then
+            echo "::error::CANDIDATE_SHA equals the triggering commit $GITHUB_SHA"
+            exit 1
+          fi
+          echo "Candidate $CANDIDATE_SHA differs from triggering commit $GITHUB_SHA"
+
+      - name: Check runner
+        id: runner
+        run: |
+          if [[ $RUNNER_ENVIRONMENT != github-hosted || $RUNNER_OS != Linux || $RUNNER_ARCH != X64 ]]; then
+            echo "::error::expected a github-hosted Linux X64 runner, got '$RUNNER_ENVIRONMENT' '$RUNNER_OS' '$RUNNER_ARCH'"
+            exit 1
+          fi
+          for tool in zip sha256sum; do
+            if ! command -v "$tool"; then
+              echo "::error::$tool is not on PATH"
+              exit 1
+            fi
+          done
+          echo "Runner is github-hosted Linux X64"
+
+      - name: Check out candidate commit
+        id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check candidate HEAD
+        id: head
+        run: |
+          head=$(git -C "$GITHUB_WORKSPACE/candidate" rev-parse HEAD)
+          if [[ $head != "$CANDIDATE_SHA" ]]; then
+            echo "::error::checked-out HEAD $head is not CANDIDATE_SHA $CANDIDATE_SHA"
+            exit 1
+          fi
+          echo "HEAD $head equals CANDIDATE_SHA"
+
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Check Python and pip
+        id: python-pip
+        run: |
+          facts=$(python -I -c 'import platform; print(platform.python_implementation(), platform.python_version(), platform.machine())')
+          if [[ $facts != "CPython $PYTHON_VERSION x86_64" ]]; then
+            echo "::error::expected CPython $PYTHON_VERSION x86_64, got $facts"
+            exit 1
+          fi
+          pip_cli=$(pip --version)
+          pip_module=$(python -m pip --version)
+          echo "pip --version: $pip_cli"
+          echo "python -m pip --version: $pip_module"
+          if [[ $pip_cli != "$pip_module" ]]; then
+            echo "::error::pip on PATH is not the pip of python on PATH"
+            exit 1
+          fi
+          pip_version=${pip_cli#pip }
+          pip_version=${pip_version%% *}
+          # Release versions only: sort -V would put 26.2.2.dev0 above 26.2.2.
+          if [[ ! $pip_version =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::pip version '$pip_version' is not a plain release version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$PIP_FLOOR" "$pip_version" | sort -C -V; then
+            echo "::error::pip $pip_version is below $PIP_FLOOR"
+            exit 1
+          fi
+          echo "CPython $PYTHON_VERSION x86_64 with pip $pip_version (at least $PIP_FLOOR)"
+
+      - name: Build ZIP with scripts/build
+        id: build
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          build_dir=$RUNNER_TEMP/build
+          mkdir "$build_dir"
+          tar -C "$GITHUB_WORKSPACE/candidate" --exclude=.git -cf - . | tar -C "$build_dir" -xf -
+          cd "$build_dir"
+          for path in reqs "$ZIP_NAME" checksums.txt; do
+            if [[ -e $path ]]; then
+              echo "::error::$path exists before the build"
+              exit 1
+            fi
+          done
+          echo "pip on PATH: $(command -v pip)"
+          ./scripts/build
+
+      - name: Check ZIP checksum
+        id: checksum
+        run: |
+          cd "$RUNNER_TEMP/build"
+          if [[ $(wc -l < checksums.txt) -ne 1 ]]; then
+            echo "::error::checksums.txt must have exactly one line"
+            exit 1
+          fi
+          read -r digest name < checksums.txt
+          if [[ $name != "$ZIP_NAME" ]]; then
+            echo "::error::checksums.txt names '$name', not $ZIP_NAME"
+            exit 1
+          fi
+          sha256sum --check --strict checksums.txt
+          echo "$ZIP_NAME sha256 $digest"
+
+      - name: Extract ZIP
+        id: extract
+        run: |
+          mkdir "$RUNNER_TEMP/zip"
+          python -I -m zipfile -e "$RUNNER_TEMP/build/$ZIP_NAME" "$RUNNER_TEMP/zip"
+          ls "$RUNNER_TEMP/zip"
+
+      - name: Check ZIP packages against export and poetry.lock
+        id: dependencies
+        shell: python -I {0}
+        run: |
+          import email
+          import os
+          import re
+          import sys
+          import tomllib
+          import zipfile
+          from pathlib import Path
+
+          FLOORS = {
+              "idna": "3.15",
+              "urllib3": "2.8.0",
+              "setuptools": "84.1.0",
+              "certifi": "2026.10.19",
+          }
+          build = Path(os.environ["RUNNER_TEMP"]) / "build"
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          def canonical(name):
+              return re.sub(r"[-_.]+", "-", name).lower()
+
+
+          def release(version):
+              if not re.fullmatch(r"\d+(\.\d+)*", version):
+                  fail(f"version '{version}' is not a plain release version")
+              parts = [int(part) for part in version.split(".")]
+              while parts and parts[-1] == 0:
+                  parts.pop()
+              return parts
+
+
+          def differences(left_label, left, right_label, right):
+              return "; ".join(
+                  f"{name}: {left_label}={left.get(name)} {right_label}={right.get(name)}"
+                  for name in sorted(left.keys() | right.keys())
+                  if left.get(name) != right.get(name)
+              )
+
+
+          locked = {}
+          for package in tomllib.loads((build / "poetry.lock").read_text())["package"]:
+              if "main" not in package["groups"]:
+                  continue
+              name = canonical(package["name"])
+              if name in locked:
+                  fail(f"poetry.lock main group has {name} twice")
+              locked[name] = (package["version"], {f["hash"] for f in package["files"]})
+
+          exported = {}
+          export = (build / "sleuth/requirements.txt").read_text().replace("\\\n", "")
+          for row in export.splitlines():
+              if not row.strip() or row.lstrip().startswith("#"):
+                  continue
+              pin = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)", row)
+              if not pin:
+                  fail(f"export row is not an exact pin: {row[:80]}")
+              name = canonical(pin[1])
+              if name in exported:
+                  fail(f"export pins {name} twice")
+              exported[name] = (pin[2], set(re.findall(r"--hash=(sha256:[0-9a-f]{64})", row)))
+
+          installed = {}
+          with zipfile.ZipFile(build / os.environ["ZIP_NAME"]) as archive:
+              for entry in archive.namelist():
+                  if re.fullmatch(r"[^/]+\.dist-info/METADATA", entry):
+                      metadata = email.message_from_bytes(archive.read(entry))
+                      name = canonical(metadata["Name"])
+                      if name in installed:
+                          fail(f"ZIP has {name} twice")
+                      installed[name] = metadata["Version"]
+
+          export_versions = {name: pin[0] for name, pin in exported.items()}
+          lock_versions = {name: entry[0] for name, entry in locked.items()}
+          if installed != export_versions:
+              fail("ZIP and export differ: " + differences("zip", installed, "export", export_versions))
+          if export_versions != lock_versions:
+              fail("export and poetry.lock main group differ: " + differences("export", export_versions, "lock", lock_versions))
+          hash_mismatches = sorted(name for name in exported if exported[name][1] != locked[name][1])
+          if hash_mismatches:
+              fail("export and poetry.lock hashes differ for: " + ", ".join(hash_mismatches))
+          for name, floor in FLOORS.items():
+              if name not in installed:
+                  fail(f"{name} is not in the ZIP")
+              if release(installed[name]) < release(floor):
+                  fail(f"{name} {installed[name]} is below the security floor {floor}")
+
+          for name in sorted(installed):
+              print(f"{name}=={installed[name]}")
+          print(f"{len(installed)} packages: ZIP == export == poetry.lock main group (versions and hashes)")
+          print("Security floors met: " + ", ".join(f"{name}>={floor}" for name, floor in FLOORS.items()))
+
+      - name: Import handler and SDKs from the ZIP only
+        id: imports
+        shell: python -I -S {0}
+        run: |
+          import os
+          import sys
+
+          NETWORK_EVENTS = {
+              "socket.connect",
+              "socket.getaddrinfo",
+              "socket.gethostbyaddr",
+              "socket.gethostbyname",
+              "socket.gethostbyname_ex",
+              "socket.getnameinfo",
+              "socket.sendmsg",
+              "socket.sendto",
+          }
+          network_attempts = []
+
+
+          def network_guard(event, args):
+              if event in NETWORK_EVENTS:
+                  network_attempts.append(f"{event}{args!r}")
+                  raise RuntimeError(f"network blocked during import check: {event}")
+
+
+          sys.addaudithook(network_guard)
+
+          import importlib.metadata
+          import re
+          import sysconfig
+          import traceback
+          import warnings
+          from pathlib import Path
+
+          CERTIFI_FLOOR = "2026.10.19"
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          def release(version):
+              if not re.fullmatch(r"\d+(\.\d+)*", version):
+                  fail(f"version '{version}' is not a plain release version")
+              parts = [int(part) for part in version.split(".")]
+              while parts and parts[-1] == 0:
+                  parts.pop()
+              return parts
+
+
+          if not (sys.flags.isolated and sys.flags.no_site):
+              fail("run this check with python -I -S")
+
+          temp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          zip_root = temp / "zip"
+          aws_config = temp / "aws-config"
+          aws_credentials = temp / "aws-credentials"
+          aws_config.touch(exist_ok=False)
+          aws_credentials.touch(exist_ok=False)
+          for name in [name for name in os.environ if name.startswith("AWS_")]:
+              del os.environ[name]
+          os.environ.update(
+              {
+                  "AWS_ACCESS_KEY_ID": "dummy-access-key-id",
+                  "AWS_SECRET_ACCESS_KEY": "dummy-secret-access-key",
+                  "AWS_REGION": "us-west-2",
+                  "AWS_DEFAULT_REGION": "us-west-2",
+                  "AWS_CONFIG_FILE": str(aws_config),
+                  "AWS_SHARED_CREDENTIALS_FILE": str(aws_credentials),
+                  "AWS_EC2_METADATA_DISABLED": "true",
+              }
+          )
+
+          paths = sysconfig.get_paths()
+          stdlib_dirs = [Path(paths[key]).resolve() for key in ("stdlib", "platstdlib")]
+          site_dirs = [Path(paths[key]).resolve() for key in ("purelib", "platlib")]
+          sys.path.insert(0, str(zip_root))
+          print("sys.path:", sys.path)
+
+          with warnings.catch_warnings(record=True) as caught:
+              warnings.simplefilter("always")
+              try:
+                  import handler
+                  import boto3
+                  import botocore
+                  import botocore.httpsession
+                  import certifi
+                  import requests
+                  import requests.certs
+              except Exception as error:
+                  traceback.print_exc()
+                  if network_attempts:
+                      fail("network attempted during import: " + "; ".join(network_attempts))
+                  fail(f"import from the ZIP failed: {error!r}")
+
+          if network_attempts:
+              fail("network attempted during import: " + "; ".join(network_attempts))
+          for warning in caught:
+              print(f"warning during import: {warning.category.__name__}: {warning.message}")
+          if any(warning.category.__name__ == "RequestsDependencyWarning" for warning in caught):
+              fail("requests reports an unsupported urllib3 or charset dependency version")
+
+          for module in (handler, boto3, botocore, requests, certifi):
+              origin = Path(module.__file__).resolve()
+              if not origin.is_relative_to(zip_root):
+                  fail(f"{module.__name__} imported from {origin}, not from the ZIP")
+              print(f"{module.__name__}: {origin}")
+
+          outside = []
+          for name, module in sorted(sys.modules.items()):
+              file = getattr(module, "__file__", None)
+              if not file or name == "__main__":
+                  continue
+              origin = Path(file).resolve()
+              in_zip = origin.is_relative_to(zip_root)
+              in_stdlib = any(origin.is_relative_to(d) for d in stdlib_dirs) and not any(
+                  origin.is_relative_to(d) for d in site_dirs
+              )
+              if not (in_zip or in_stdlib):
+                  outside.append(f"{name} from {origin}")
+          if outside:
+              fail("modules loaded from outside the ZIP and the standard library: " + ", ".join(outside))
+
+          certifi_dist = importlib.metadata.distribution("certifi")
+          if Path(certifi_dist.locate_file("")).resolve() != zip_root:
+              fail(f"certifi metadata is not the ZIP's: {certifi_dist.locate_file('')}")
+          if release(certifi_dist.version) < release(CERTIFI_FLOOR):
+              fail(f"ZIP certifi {certifi_dist.version} is below the floor {CERTIFI_FLOOR}")
+          store = Path(certifi.where()).resolve()
+          if not (store.is_file() and store.is_relative_to(zip_root)):
+              fail(f"certifi.where() {store} is not a file in the ZIP")
+          for label, path in (
+              ("requests.certs.where()", requests.certs.where()),
+              ("botocore.httpsession.get_cert_path(True)", botocore.httpsession.get_cert_path(True)),
+          ):
+              if Path(path).resolve() != store:
+                  fail(f"{label} is {path}, not the ZIP's certifi store {store}")
+              print(f"{label}: {path}")
+
+          print(f"ZIP certifi {certifi_dist.version} (floor {CERTIFI_FLOOR}) store: {store}")
+          print(f"{len(sys.modules)} modules loaded, all from the ZIP or the standard library")
+          print("No network attempts during import")
