@@ -373,7 +373,8 @@ jobs:
           outside = []
           for name, module in sorted(sys.modules.items()):
               file = getattr(module, "__file__", None)
-              if not file or name == "__main__":
+              # Importing multiprocessing re-registers this script as __mp_main__; skip only that same object.
+              if not file or module is sys.modules["__main__"]:
                   continue
               origin = Path(file).resolve()
               in_zip = origin.is_relative_to(zip_root)
